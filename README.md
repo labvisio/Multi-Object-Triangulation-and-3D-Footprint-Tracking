@@ -1,6 +1,6 @@
-# Multi-Object Triangulation and 3D Footprint Tracking
+# Multi-Object Triangulation and 3D Footprint Tracking - Intelligent Space
 
-**Multi-camera computer vision system for 3D object detection, triangulation and tracking.**
+**Multi-camera computer vision system for 3D object detection, triangulation and tracking with real-time streaming capabilities.**
 
 <div align="center">
   <img src="docs/example.gif" alt="Multi-Camera 3D Tracking Demo" width="800">
@@ -23,45 +23,57 @@
 
 ## Overview
 
-This project implements a multi-camera tracking system that combines YOLO object detection, epipolar geometry-based matching, triangulation and 3D tracking to provide 3D object localization and trajectory tracking. The system is designed for research and applications requiring spatial awareness across multiple synchronized camera views.
+This project implements a comprehensive multi-camera tracking system that combines YOLO object detection, epipolar geometry-based matching, triangulation and 3D tracking to provide 3D object localization and trajectory tracking. The system supports both offline video processing and real-time streaming from live camera feeds, making it suitable for research applications, surveillance systems, and intelligent space monitoring.
 
 ### Key Features
 
 - **Multi-Camera Synchronization**: Processes 2 or more synchronized camera feeds simultaneously
-- **YOLO Integration**: Object detection with YOLOv11 support
+- **Real-Time Streaming**: Live processing from camera feeds via AMQP/RabbitMQ protocol
+
 - **Epipolar Geometry Matching**: Cross-view correspondence using fundamental matrices
 - **3D Triangulation**: RANSAC-based triangulation with outlier rejection
 - **3D Tracking**: 3D algorithm for consistent 3D object tracking
 - **Visualization**: Multi-view display with 3D plotting and detection graphs
-- **Multiple Reference Points**: Multiple bounding box reference points for different tracking scenarios
-- **Output**: JSON coordinate export, video recording, and figure export
+- **Multiple Reference Points**: Configurable bounding box reference points for different tracking scenarios
+- **Protocol Buffer Integration**: Real-time data publishing using Protocol Buffers
+- **Comprehensive Output**: JSON coordinate export, video recording, and high-resolution figure export
+- **Intelligent Space Integration**: Native support for IS-Wire communication protocol
 
 ## System Architecture
 
 ```mermaid
 graph TD
-    A[Camera 0-3<br/>Video Feeds] --> B[YOLO Detection<br/>& Tracking]
-    B --> C[Cross-view<br/>Matching]
-    C --> D[3D<br/>Triangulation]
-    D --> E{3D Tracking<br/>Enabled?}
-    E -->|Yes| F[3D<br/>Tracking]
-    E -->|No| G[Raw 3D<br/>Coordinates]
-    F --> H[Visualization<br/>& Export]
-    G --> H
-    H --> I[Multi-camera<br/>Video Mosaic]
-    H --> J[Detection<br/>Graph Display]
-    H --> K[3D Position<br/>Plot]
-    H --> L[JSON<br/>Output]
-    H --> M[Video<br/>Recording]
+    A[Camera Feeds<br/>Live/Video] --> B{Input Mode}
+    B -->|Real-time| C[AMQP/RabbitMQ<br/>Streaming]
+    B -->|Offline| D[Video Files<br/>Processing]
+    C --> E[YOLO Detection<br/>& BoT-SORT Tracking]
+    D --> E
+    E --> F[Cross-view<br/>Matching]
+    F --> G[3D<br/>Triangulation]
+    G --> H{SORT 3D<br/>Tracking?}
+    H -->|Yes| I[3D Object<br/>Tracking]
+    H -->|No| J[Raw 3D<br/>Coordinates]
+    I --> K[Visualization<br/>& Export]
+    J --> K
+    K --> L[Multi-camera<br/>Video Mosaic]
+    K --> M[Detection<br/>Graph Display]
+    K --> N[3D Position<br/>Plot & Trajectories]
+    K --> O[JSON<br/>Output]
+    K --> P[Video<br/>Recording]
+    K --> Q[Protocol Buffer<br/>Publishing]
+    K --> R[High-res Figure<br/>Export]
     
     style A fill:#e1f5fe
-    style B fill:#f3e5f5
-    style C fill:#e8f5e8
-    style D fill:#fff3e0
-    style E fill:#fce4ec
-    style F fill:#e0f2f1
-    style G fill:#e0f2f1
-    style H fill:#f1f8e9
+    style B fill:#fff3e0
+    style C fill:#f3e5f5
+    style D fill:#f3e5f5
+    style E fill:#e8f5e8
+    style F fill:#e8f5e8
+    style G fill:#fff3e0
+    style H fill:#fce4ec
+    style I fill:#e0f2f1
+    style J fill:#e0f2f1
+    style K fill:#f1f8e9
 ```
 
 ## Results and Examples
@@ -123,6 +135,13 @@ pip install -r requirements.txt
 - `ultralytics==8.3.40` - YOLO object detection
 - `lap` - Linear assignment problem solver
 
+#### Real-Time Streaming Dependencies
+
+- `is-msgs` - Intelligent Space message definitions
+- `is-wire` - AMQP/RabbitMQ communication protocol
+- `google-protobuf` - Protocol Buffer serialization
+- `rabbitmq-server` - Message broker for real-time communication
+
 ### Project Structure
 
 ```
@@ -132,6 +151,7 @@ Multi-Object-Triangulation_and_3D_Footprint_Tracking/
 │   ├── config.py               # Configuration settings
 │   ├── detection.py            # Object detection data structures
 │   ├── video_loader.py         # Multi-camera video handling
+│   ├── live_video_loader.py    # Real-time streaming handlers
 │   ├── tracker.py              # YOLO tracking wrapper
 │   ├── matcher.py              # Cross-view matching algorithm
 │   ├── triangulation.py        # 3D reconstruction methods
@@ -141,7 +161,13 @@ Multi-Object-Triangulation_and_3D_Footprint_Tracking/
 │   ├── visualization_utils.py   # Visualization helpers
 │   ├── graph_visualization.py   # Detection graph display
 │   ├── io_utils.py             # Input/output operations
-│   └── ploting_utils.py        # Plotting utilities
+│   ├── ploting_utils.py        # Plotting utilities
+│   ├── subscriber.py           # Protocol buffer subscriber
+│   ├── yolo_conf.yaml          # YOLO tracking configuration
+│   └── protobuf/               # Protocol buffer definitions
+│       ├── config.json         # Streaming configuration
+│       ├── message.proto       # Message schema definitions
+│       └── message_pb2.py      # Generated Python classes
 ├── config_camera/              # Camera calibration files
 │   ├── 0.json                  # Camera 0 parameters
 │   ├── 1.json                  # Camera 1 parameters
@@ -168,6 +194,8 @@ videos/
 └── cam3.mp4    # Camera 3 video
 ```
 
+For real-time operation, configure the message broker and camera publishers as described in the Real-Time Setup section.
+
 ## Usage
 
 ### Basic Usage
@@ -181,6 +209,12 @@ python source/main.py --video_path videos --use_3d_tracker
 
 # Save 3D coordinates to JSON file
 python source/main.py --video_path videos --save_coordinates --output_file tracking_results.json
+
+# Real-time mode with live camera feeds
+python source/main.py --realtime --use_3d_tracker --save_coordinates
+
+# Real-time with Protocol Buffer publishing
+python source/main.py --realtime --use_3d_tracker --publish
 ```
 
 ### Advanced Configuration
@@ -201,8 +235,14 @@ python source/main.py --video_path videos --use_3d_tracker --max_age 15 --min_hi
 # Headless processing (no visualization)
 python source/main.py --video_path videos --headless --save_coordinates
 
-# Export figures
+# Export high-resolution figures
 python source/main.py --video_path videos --export_figures --export_dpi 600
+
+# Process specific cameras only
+python source/main.py --video_path videos --cam_numbers 0 1 2
+
+# Real-time with custom camera selection
+python source/main.py --realtime --cam_numbers 0 2 3 --use_3d_tracker
 ```
 
 ### Command Line Arguments
@@ -213,7 +253,14 @@ python source/main.py --video_path videos --export_figures --export_dpi 600
 | `--video_path` | str | "videos" | Path to video files directory |
 | `--output_file` | str | "output.json" | Output JSON file for 3D coordinates |
 | `--save_coordinates` | flag | False | Save 3D coordinates to JSON file |
-| `--use_3d_tracker` | flag | False | Enable 3D tracking algorithm |
+| `--use_3d_tracker` | flag | True | Enable SORT 3D tracking algorithm |
+| `--realtime` | flag | False | Process real-time camera feeds |
+| `--publish` | flag | False | Publish to Protocol Buffer channel |
+
+#### Camera Parameters
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--cam_numbers` | int[] | [0,1,2,3] | Camera numbers to process |
 
 #### YOLO Parameters
 | Argument | Type | Default | Description |
@@ -252,8 +299,36 @@ python source/main.py --video_path videos --export_figures --export_dpi 600
 | `--no-video` | Disable video mosaic |
 | `--save-video` | Save output video |
 | `--export_figures` | Export final plots |
+| `--export_dpi` | DPI for exported figures (default: 300) |
+| `--figures_output_dir` | Directory for exported figures |
 
 ## Technical Implementation
+
+### Real-Time Streaming System
+
+The system supports real-time processing through an Intelligent Space (IS) architecture:
+
+1. **AMQP/RabbitMQ Communication**: Uses message broker for camera feed distribution
+2. **Protocol Buffer Integration**: Structured data serialization for efficient transmission
+3. **StreamChannel Management**: Handles multiple camera subscriptions simultaneously
+4. **Frame Synchronization**: Ensures temporal alignment across camera feeds
+5. **Health Monitoring**: Tracks camera connectivity and frame drop detection
+
+#### Protocol Buffer Schema
+
+```protobuf
+message Points {
+    repeated float position = 1;  // 3D coordinates [x, y, z]
+    int32 id = 2;                // Track ID
+    int32 name = 3;              // Class ID
+}
+
+message Detections {
+    string timestamp = 1;         // Frame timestamp
+    int32 frame = 2;             // Frame number
+    repeated Points points = 3;   // List of detected objects
+}
+```
 
 ### Multi-View Matching System
 
@@ -311,6 +386,28 @@ NetworkX-based graph representation for managing detection relationships:
 }
 ```
 
+### Protocol Buffer Stream
+
+Real-time data publishing for integration with other systems:
+
+```python
+# Example subscriber usage
+from source.subscriber import Detections, Points
+
+# Process received detections
+for point in detection.points:
+    position = point.position  # [x, y, z]
+    track_id = point.id
+    class_id = point.name
+```
+
+### High-Resolution Figure Export
+
+- **Video Mosaic**: Multi-camera view with annotations
+- **3D Plot**: Trajectory visualization with camera positions  
+- **Detection Graph**: Network representation of correspondences
+- **Customizable DPI**: 300-600 DPI for publication quality
+
 ## Tools and Analysis
 
 The `tools/` directory contains utilities for:
@@ -367,28 +464,69 @@ The system requires camera calibration files in JSON format containing:
 Example calibration file structure:
 ```json
 {
-  "calibratedAt": "2025-04-04T14:17:05.558577Z",
-  "error": 0.2824207223298144,
+  "id": "0",
+  "calibratedAt": "2025-04-22T17:17:37.270140Z",
+  "error": 0.22570861607749015,
   "resolution": {"height": 728, "width": 1288},
-  "intrinsic": {...},
+  "intrinsic": {
+    "shape": {"dims": [{"size": 3, "name": "rows"}, {"size": 3, "name": "cols"}]},
+    "type": "DOUBLE_TYPE",
+    "doubles": [1013.96, 0.0, 620.61, 0.0, 1013.42, 377.48, 0.0, 0.0, 1.0]
+  },
   "extrinsic": {...},
   "distortion": {...}
 }
 ```
+
+## Real-Time Setup
+
+### Message Broker Configuration
+
+1. **Install RabbitMQ server**:
+```bash
+sudo apt-get install rabbitmq-server
+sudo systemctl start rabbitmq-server
+```
+
+2. **Configure connection** in `source/protobuf/config.json`:
+```json
+{
+    "address": "localhost:5672",
+    "cameras": [0, 1, 2, 3]
+}
+```
+
+3. **Camera Gateway Setup**: Configure camera publishers to send frames to topics:
+   - `CameraGateway.0.Frame`
+   - `CameraGateway.1.Frame`
+   - `CameraGateway.2.Frame`
+   - `CameraGateway.3.Frame`
+
+### Protocol Buffer Integration
+
+The system publishes tracking results to topic `is.tracker.detections` using the defined Protocol Buffer schema. Subscribe to this topic to receive real-time 3D tracking data in other applications.
 
 ## Troubleshooting
 
 ### Common Issues
 
 **No detections found:**
-- Check YOLO model compatibility
+- Check YOLO model compatibility and path
 - Adjust confidence threshold (`--confidence`)
 - Verify video file formats and paths
+- Ensure correct class IDs in `--class_list`
 
 **Poor 3D reconstruction:**
 - Validate camera calibration files
 - Check camera synchronization
 - Adjust matching thresholds (`--distance_threshold`, `--drift_threshold`)
+- Verify sufficient camera overlap for triangulation
+
+**Real-time streaming issues:**
+- Check RabbitMQ server status and configuration
+- Verify camera gateway publishers are active
+- Monitor network connectivity and latency
+- Check topic names match configuration
 
 **Performance issues:**
 - Enable GPU for YOLO inference
@@ -421,14 +559,18 @@ If you use this work in your research, please cite:
 ## Acknowledgments
 
 - YOLO implementation by Ultralytics
--  algorithm by Alex Bewley et al.
+- SORT algorithm by Alex Bewley et al.
+- BoT-SORT tracking by Nir Aharon et al.
 - OpenCV and NetworkX communities
+- Intelligent Space (IS) framework contributors
 - Camera calibration tools and methodologies
 
 ## Related Work
 
 - [SORT: Simple, Online, and Realtime Tracking](https://arxiv.org/abs/1602.00763)
+- [BoT-SORT: Robust Associations Multi-Pedestrian Tracking](https://arxiv.org/abs/2206.14651)
 - [YOLOv11: Real-Time Object Detection](https://ultralytics.com)
 - [Multiple View Geometry in Computer Vision](https://www.robots.ox.ac.uk/~vgg/hzbook/)
+- [Intelligent Space: Concept and Contents](https://ieeexplore.ieee.org/document/811761)
 
 ---

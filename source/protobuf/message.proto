@@ -1,0 +1,16 @@
+syntax = "proto3";
+package teste;
+
+message Points{
+    repeated float position = 1;
+    int32 id = 2;
+    int32 name = 3;
+
+
+}
+
+message Detections{
+    string timestamp = 1;
+    int32 frame = 2;
+    repeated Points points = 3;
+}

@@ -16,7 +16,6 @@ import argparse
 import time
 import logging
 import os
-import sys
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -24,7 +23,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib import patheffects, cm
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.colors as mcolors
-
+import socket
 import json
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -44,6 +43,14 @@ from io_utils import save_3d_coordinates_with_ids
 from visualization_utils import  draw_bbox, visualize_camera_positions
 from graph_visualization import visualize_graph
 
+# Intelligent space imports
+from is_msgs.image_pb2 import Image
+from google.protobuf.json_format import Parse
+from is_project.conf.options_pb2 import ServiceOptions
+from is_wire.core import Channel, Message, Subscription
+from google.protobuf.message import Message as PbMessage
+
+from live_video_loader import StreamChannel, to_np, load_json, publish
 # Set global font size to 12 (same as plot_from_json.py)
 plt.rcParams['font.size'] = 12
 plt.rcParams['font.family'] = 'serif'
@@ -73,7 +80,7 @@ def main():
     argparser = argparse.ArgumentParser(description="Multi-Camera Tracking and 3D Reconstruction")
     argparser.add_argument("--video_path", type=str, default="videos", help="Path to video files")
     argparser.add_argument("--output_file", type=str, default="output.json", help="Output JSON file for 3D coordinates")
-    argparser.add_argument("--save_coordinates", default=True ,action="store_true", help="Save 3D coordinates to JSON file")
+    argparser.add_argument("--save_coordinates", default=False ,action="store_true", help="Save 3D coordinates to JSON file")
     argparser.add_argument("--use_3d_tracker",default=True, action="store_true", help="Use algorithm for 3D tracking")
     argparser.add_argument("--max_age", type=int, default=10, help="Maximum frames object can be missing (SORT)")
     argparser.add_argument("--min_hits", type=int, default=3, help="Minimum hits to start tracking (SORT)")
@@ -93,9 +100,12 @@ def main():
     argparser.add_argument("--no-graph", action="store_true", help="Disable correspondence graph visualization")
     argparser.add_argument("--no-3d", action="store_true", help="Disable 3D plot visualization")
     argparser.add_argument("--no-video", action="store_true", help="Disable video mosaic visualization")
-    argparser.add_argument("--save-video", action="store_true", help="Save output video regardless of visualization settings")
+    argparser.add_argument("--save-video", action="store_true",default=False, help="Save output video regardless of visualization settings")
     argparser.add_argument("--output-video", type=str, default="output.mp4", help="Path to save the output video")
-     
+    argparser.add_argument("--publish", action="store_true",default=False, help="Publish 3D coordinates to channel")
+    argparser.add_argument("--cam_numbers", type=int, nargs='+', default=[0, 1, 2, 3],
+                          help="List of camera numbers to process (default: [0, 1, 2, 3])")
+    argparser.add_argument("--realtime", action="store_true", default=False, help="Run in real-time mode (process frames from a realtime camera feed)")
     # Arguments for exporting figures
     argparser.add_argument("--export_figures", action="store_true", help="Enable exporting of final plots (video mosaic, graph, 3D plot).")
     argparser.add_argument("--export_dpi", type=int, default=300, help="DPI for exported figures.")
@@ -118,20 +128,25 @@ def main():
     drift_threshold = args.drift_threshold
     reference_point = args.reference_point
     output_video_path = args.output_video
-    
+
     # Handle visualization settings with opt-out approach
     show_plot = not args.headless
     show_graph = show_plot and not args.no_graph
     show_3d = show_plot and not args.no_3d
     show_video = show_plot and not args.no_video
     save_video = args.save_video
+    publish_flag = args.publish
+    cam_numbers = args.cam_numbers
+    realtime_flag = args.realtime
+    
     
     # Arguments for exporting figures
     export_figures = args.export_figures
     export_dpi = args.export_dpi
     figures_output_dir = args.figures_output_dir
 
-    logging.info(f"Video path: {video_path}")
+    if not realtime_flag:
+        logging.info(f"Video path: {video_path}")
     logging.info(f"Output file: {output_json_file}")
     logging.info(f"Using SORT 3D tracker: {use_sort}")
     logging.info(f"Visualization: Plot={show_plot}, Graph={show_graph}, 3D={show_3d}, Video={show_video}")
@@ -140,21 +155,25 @@ def main():
     if not os.path.exists(video_path):
         raise ValueError(f"Video path not found: {video_path}")
 
-    video_files = os.listdir(video_path)
-    logging.info(f"Video files: {video_files}")
+    if not realtime_flag:
+       video_files = os.listdir(video_path)
+       logging.info(f"Video files: {video_files}")
 
-    video_files = [os.path.join(video_path, f).replace("\\", "/") for f in video_files]
-    logging.info(f"Video files: {video_files}")
+       video_files = [os.path.join(video_path, f).replace("\\", "/") for f in video_files]
+       logging.info(f"Video files: {video_files}")
 
-    cam_numbers = [
-        int(os.path.basename(cam).replace("cam", "").replace(".mp4", ""))
-        for cam in video_files
-    ]
+    # Ensure cam_numbers is a list of integers
+    if isinstance(cam_numbers, int):
+        cam_numbers = [cam_numbers]
+    elif isinstance(cam_numbers, str):
+        cam_numbers = [int(num) for num in cam_numbers.split(',')]
+    # Ensure cam_numbers are unique and sorted
+    cam_numbers = sorted(set(cam_numbers))
+
     logging.info(f"Cam numbers: {cam_numbers}")
 
     # Create utils instance
     utils = Utils()
-    video_loader = VideoLoader(video_files)
     tracker = Tracker([yolo_model for _ in range(len(cam_numbers))], cam_numbers, class_list, confidence)
     matcher = Matcher(distance_threshold, drift_threshold)
     
@@ -281,437 +300,501 @@ def main():
     
     # Initialize video writer if saving video
     video_writer = None
-    
-    for frame_number in range(video_loader.get_number_of_frames()):
+   
+
+    frame_number = 0  # Reset frame number for each iteration
+    # Add variables to track camera feed health
+
+    last_frame_time = {}
+    connections_healthy = True
+
+    # Create dictionaries to store channels and subscriptions for each camera
+    channels = {}
+    subscriptions = {}
+    camera_status = {}  # Track camera health
+    with open("source/protobuf/config.json", "r") as f:
+        config = json.load(f)
+    publish_channel = StreamChannel(f"amqp://guest:guest@{config['address']}")
+
+    # Create a channel and subscription for each camera
+    for cam_idx in cam_numbers:
+        try:
+            channels[cam_idx] = StreamChannel(f"amqp://guest:guest@{config['address']}")
+            subscriptions[cam_idx] = Subscription(channels[cam_idx], name=f"CameraCapture{cam_idx}")
+            subscriptions[cam_idx].subscribe(topic=f"CameraGateway.{cam_idx}.Frame")
+            camera_status[cam_idx] = {"connected": True, "last_seen": time.time()}
+            logging.info(f"Successfully subscribed to camera {cam_idx}")
+        except Exception as e:
+            logging.error(f"Failed to subscribe to camera {cam_idx}: {e}")
+            camera_status[cam_idx] = {"connected": False, "last_seen": None}
+
+    while True:
+        frames = []
+        current_time = time.time()
+        frame_collected = [False] * len(cam_numbers)
         
-        graph = nx.Graph()
-        frames = video_loader.get_frames()
-        tracker.detect_and_track(frames)
-        detections = tracker.get_detections()
-        triangulated_points = []
-        graph_component_ids = []
-        node_color_map = {}
+        # Collect frames from all cameras with timeout
+        start_collection_time = time.time()
+        collection_timeout = 1.0  # 1 second timeout for frame collection
         
-        # Process detections and build graph
-        for d in detections:
-            print(f"Detection ID: {d}")
-            id = int(d.id)
-            bbox = d.bbox
-            cam = int(d.cam)
-            frame = d.frame
-            centroid = d.centroid
-            name = d.name
-            graph.add_node(
-                f"cam{cam}id{id}",
-                bbox=bbox,
-                id=id,
-                frame=frame,
-                centroid=centroid,
-                name=name,
-            )
-
-            # Get color based on ID for consistency
-            color_rgb = utils.id_to_rgb_color(id)
-            
-            # Get class name string if available
-            class_name = CLASS_NAMES.get(int(name), f"Class {int(name)}")
-            
-            # Draw stylish bounding box
-            frame = draw_bbox(
-                frame, 
-                bbox, 
-                class_name, 
-                id, 
-                color_rgb,
-                reference_point  # Pass the reference point to the drawing function
-            )
-
-        # Match detections and build edges
-        for k in cam_numbers:
-            for j in cam_numbers:
-                if k != j and k < j:
-                    matches = matcher.match_detections(detections, [k, j])
-                    for match in matches:
-                        n1 = f"cam{k}id{int(match[0].id)}"
-                        n2 = f"cam{j}id{int(match[1].id)}"
-                        if n1 in graph.nodes and n2 in graph.nodes:
-                            graph.add_edge(n1, n2)
-        print("-\n" * 5)
-
-        # Process triangulation
-        class_ids = []  # Store class IDs for each triangulated point
-        track_colors = {}  # Dictionary to store consistent colors by track ID
-        
-        for idx, c in enumerate(nx.connected_components(graph)):
-            subgraph = graph.subgraph(c)
-            if len(subgraph.nodes) > 1:
-                ids = sorted(subgraph.nodes)
-                d2_points = []
-                proj_matricies = []
-                # Extract class from first node (all nodes in component should have same class)
-                class_id = subgraph.nodes[ids[0]]["name"]
-
-                for node in ids:
-                    cam = int(node.split("cam")[1].split("id")[0])
-                    id = int(node.split("id")[1])
-                    centroid = subgraph.nodes[node]["centroid"]
-                    bbox = subgraph.nodes[node]["bbox"]
-                    P_cam = matcher.P_all[cam]
+        while not all(frame_collected) and (time.time() - start_collection_time) < collection_timeout:
+            for cam_idx, cam in enumerate(cam_numbers):
+                if frame_collected[cam_idx]:
+                    continue  # Skip if frame already collected for this camera
                     
-                    # Get reference point based on user selection
-                    if reference_point == "center":
-                        # Use the center of the bounding box
-                        point_2d = ((bbox[2]+bbox[0])/2, (bbox[3]+bbox[1])/2)
-                    elif reference_point == "top_center":
-                        # Use the top-center point
-                        point_2d = ((bbox[2]+bbox[0])/2, bbox[1])
-                    elif reference_point == "feet":
-                        # Use the bottom-center point but offset slightly from the edge
-                        # This helps with cases where the bottom of the bounding box is slightly below the feet
-                        bottom_offset = 0.2 * (bbox[3] - bbox[1])  # 20% offset from bottom
-                        point_2d = ((bbox[2]+bbox[0])/2, bbox[3] - bottom_offset)
-                    else:  # Default to bottom_center
-                        # Use the bottom-center point
-                        point_2d = ((bbox[2]+bbox[0])/2, bbox[3])
-                    
-                    d2_points.append(point_2d)
-                    proj_matricies.append(P_cam)
+                try:
+                    message, dropped = channels[cam].consume_last()
+                    if message is not None:
+                        image = message.unpack(Image)
+                        frame = to_np(image)
 
-                if len(d2_points) >= 2:
-                    point_3d, _ = triangulate_ransac(
-                        proj_matricies, d2_points
-                    )
-                    print(f"3D point: {point_3d}")
-                    triangulated_points.append(point_3d)
-                    graph_component_ids.append(idx)
-                    class_ids.append(class_id)  # Store class ID with triangulated point
-                    
-                    # Use a temporary ID for color mapping - this will be corrected after SORT
-                    temp_color_rgb = utils.id_to_rgb_color(idx)
-                    track_colors[idx] = temp_color_rgb
-                    
-                    for node in subgraph.nodes:
-                        node_color_map[node] = utils.normalize_rgb_color(temp_color_rgb)
-        
-        # If we're using SORT, update the 3D tracker
-        if use_sort and triangulated_points:
-            # Update the SORT tracker with triangulated points AND their classes
-            sort_result = sort_tracker.update(triangulated_points, class_ids)
+                        if frame is not None:
+                            # Ensure frames list has enough slots
+                            while len(frames) <= cam_idx:
+                                frames.append(None)
+                            
+                            frames[cam_idx] = frame
+                            frame_collected[cam_idx] = True
+                            last_frame_time[cam] = current_time
+                            
+                            if dropped > 10:
+                                logging.warning(f"Camera {cam}: Dropped {dropped} frames")
+                            
+                except socket.timeout:
+                    # Expected timeout when no new frames available
+                    continue
+                except Exception as e:
+                    logging.error(f"Error reading from camera {cam}: {e}")
+                    # Mark as failed for this iteration
+                    frame_collected[cam_idx] = False
+
+        # Check if we have frames from all cameras
+        valid_frames = sum(frame_collected)
+        if valid_frames == len(cam_numbers):
+            logging.info(f"Frame {frame_number}: Successfully collected frames from all {len(cam_numbers)} cameras")
             
-            # Use the SORT-tracked versions directly
-            point_3d_list = sort_result['positions']
-            track_ids = sort_result['ids']
-            sorted_class_ids = sort_result['class_ids']  # Classes are now maintained by SORT
-            trajectories = sort_result['trajectories']
+            # Process the complete frame set
+            graph = nx.Graph()
+            tracker.detect_and_track(frames)
+            detections = tracker.get_detections()
+            triangulated_points = []
+            graph_component_ids = []
+            node_color_map = {}
             
-            # CRITICAL FIX: Update colors based on actual track IDs from SORT
-            # Clear previous temporary colors
-            track_colors.clear()
-            node_color_map.clear()
-            
-            # Assign colors based on SORT track IDs for consistency
-            for i, (point_3d, track_id) in enumerate(zip(point_3d_list, track_ids)):
-                color_rgb = utils.id_to_rgb_color(track_id)
-                track_colors[track_id] = color_rgb
+            # Process detections and build graph
+            for d in detections:
+                id = int(d.id)
+                bbox = d.bbox
+                cam = int(d.cam)
+                frame = d.frame
+                centroid = d.centroid
+                name = d.name
+                graph.add_node(
+                    f"cam{cam}id{id}",
+                    bbox=bbox,
+                    id=id,
+                    frame=frame,
+                    centroid=centroid,
+                    name=name,
+                )
+
+                # Get color based on ID for consistency
+                color_rgb = utils.id_to_rgb_color(id)
                 
-                # Update node colors for graph visualization
-                # Find the corresponding graph nodes for this point
-                if i < len(triangulated_points):
-                    # Match the SORT point back to original triangulated points to find graph nodes
-                    for comp_idx, orig_point in enumerate(triangulated_points):
-                        # Check if this SORT point corresponds to this original point
-                        distance = np.linalg.norm(np.array(point_3d) - np.array(orig_point))
-                        if distance < 0.1:  # Small threshold for matching
-                            # Find nodes in the corresponding graph component
-                            components = list(nx.connected_components(graph))
-                            if comp_idx < len(components):
-                                component_nodes = components[comp_idx]
-                                for node in component_nodes:
-                                    node_color_map[node] = utils.normalize_rgb_color(color_rgb)
-                            break
-            
-            logging.info(f"Frame {frame_number}: SORT tracking {len(point_3d_list)} objects")
-            
-        else:
-            # Without SORT, use raw triangulated points
-            point_3d_list = triangulated_points
-            track_ids = graph_component_ids
-            trajectories = {}
-            sorted_class_ids = class_ids
-            
-            # For non-SORT mode, colors are already assigned correctly above
+                # Get class name string if available
+                class_name = CLASS_NAMES.get(int(name), f"Class {int(name)}")
+                
+                # Draw bounding box
+                frames[cam] = draw_bbox(
+                    frames[cam], 
+                    bbox, 
+                    class_name, 
+                    id, 
+                    color_rgb,
+                    reference_point
+                )
 
-        # Save coordinates if requested
-        if save_flag and point_3d_list:
-            if use_sort:
-                # Save with track IDs and class IDs for consistent tracking
-                save_3d_coordinates_with_ids(frame_number, point_3d_list, track_ids, output_json_file, sorted_class_ids)
+            # Match detections and build edges
+            for k in cam_numbers:
+                for j in cam_numbers:
+                    if k != j and k < j:
+                        matches = matcher.match_detections(detections, [k, j])
+                        for match in matches:
+                            n1 = f"cam{k}id{int(match[0].id)}"
+                            n2 = f"cam{j}id{int(match[1].id)}"
+                            if n1 in graph.nodes and n2 in graph.nodes:
+                                graph.add_edge(n1, n2)
+
+            # Process triangulation
+            class_ids = []
+            track_colors = {}
+            
+            for idx, c in enumerate(nx.connected_components(graph)):
+                subgraph = graph.subgraph(c)
+                if len(subgraph.nodes) > 1:
+                    ids = sorted(subgraph.nodes)
+                    d2_points = []
+                    proj_matricies = []
+                    class_id = subgraph.nodes[ids[0]]["name"]
+
+                    for node in ids:
+                        cam = int(node.split("cam")[1].split("id")[0])
+                        id = int(node.split("id")[1])
+                        centroid = subgraph.nodes[node]["centroid"]
+                        bbox = subgraph.nodes[node]["bbox"]
+                        P_cam = matcher.P_all[cam]
+                        
+                        # Get reference point based on user selection
+                        if reference_point == "center":
+                            point_2d = ((bbox[2]+bbox[0])/2, (bbox[3]+bbox[1])/2)
+                        elif reference_point == "top_center":
+                            point_2d = ((bbox[2]+bbox[0])/2, bbox[1])
+                        elif reference_point == "feet":
+                            bottom_offset = 0.2 * (bbox[3] - bbox[1])
+                            point_2d = ((bbox[2]+bbox[0])/2, bbox[3] - bottom_offset)
+                        else:  # bottom_center
+                            point_2d = ((bbox[2]+bbox[0])/2, bbox[3])
+                        
+                        d2_points.append(point_2d)
+                        proj_matricies.append(P_cam)
+
+                    if len(d2_points) >= 2:
+                        point_3d, _ = triangulate_ransac(proj_matricies, d2_points)
+                        triangulated_points.append(point_3d)
+                        graph_component_ids.append(idx)
+                        class_ids.append(class_id)
+                        
+                        temp_color_rgb = utils.id_to_rgb_color(idx)
+                        track_colors[idx] = temp_color_rgb
+                        
+                        for node in subgraph.nodes:
+                            node_color_map[node] = utils.normalize_rgb_color(temp_color_rgb)
+            
+            # SORT tracking and visualization code remains the same...
+            # ...existing code for SORT tracking...
+            
+            # If we're using SORT, update the 3D tracker
+            if use_sort and triangulated_points:
+                sort_result = sort_tracker.update(triangulated_points, class_ids)
+                point_3d_list = sort_result['positions']
+                track_ids = sort_result['ids']
+                sorted_class_ids = sort_result['class_ids']
+                trajectories = sort_result['trajectories']
+                
+                # Update colors based on actual track IDs from SORT
+                track_colors.clear()
+                node_color_map.clear()
+                
+                for i, (point_3d, track_id) in enumerate(zip(point_3d_list, track_ids)):
+                    color_rgb = utils.id_to_rgb_color(track_id)
+                    track_colors[track_id] = color_rgb
+                    
+                    if i < len(triangulated_points):
+                        for comp_idx, orig_point in enumerate(triangulated_points):
+                            distance = np.linalg.norm(np.array(point_3d) - np.array(orig_point))
+                            if distance < 0.1:
+                                components = list(nx.connected_components(graph))
+                                if comp_idx < len(components):
+                                    component_nodes = components[comp_idx]
+                                    for node in component_nodes:
+                                        node_color_map[node] = utils.normalize_rgb_color(color_rgb)
+                                break
+                
+                logging.info(f"Frame {frame_number}: SORT tracking {len(point_3d_list)} objects")
             else:
-                # For backward compatibility, use the original function when not using SORT
-                save_3d_coordinates_with_ids(frame_number, point_3d_list, track_ids, output_json_file, class_ids)
-        elif save_flag:
-            logging.info(f"No 3D points detected for frame {frame_number}")
+                point_3d_list = triangulated_points
+                track_ids = graph_component_ids
+                trajectories = {}
+                sorted_class_ids = class_ids
 
-        # Create video mosaic with annotations and better formatting if video visualization is enabled
-        if show_plot and show_video:
-            processed_frames = []
-            for idx, frame in enumerate(frames):
-                # Convert BGR to RGB for matplotlib
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Save coordinates if requested
+            if save_flag and point_3d_list:
+                if use_sort:
+                    save_3d_coordinates_with_ids(frame_number, point_3d_list, track_ids, output_json_file, sorted_class_ids)
+                else:
+                    save_3d_coordinates_with_ids(frame_number, point_3d_list, track_ids, output_json_file, class_ids)
+            
+            if publish_flag and point_3d_list:
+                publish(channel=publish_channel, frame=frame_number, point_3d_list=point_3d_list, track_ids=track_ids, class_ids=sorted_class_ids)
+            # Create video mosaic with annotations and better formatting if video visualization is enabled
+            
+            if show_plot and show_video:
+                processed_frames = []
+                for idx, frame in enumerate(frames):
+                    # Convert BGR to RGB for matplotlib
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Add a nice camera label
+                    h, w = rgb_frame.shape[:2]
+                    overlay = rgb_frame.copy()
+                    cv2.rectangle(overlay, (0, 0), (175, 40), (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.7, rgb_frame, 0.3, 0, rgb_frame)
+                    cv2.putText(rgb_frame, f"Camera {idx}", (10, 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+                    
+                    processed_frames.append(cv2.resize(rgb_frame, (540, 360)))
+
+                # Create video mosaic with a small border between frames
+                border = np.ones((360, 5, 3), dtype=np.uint8) * 255  # White vertical border
+                h_border = np.ones((5, 1085, 3), dtype=np.uint8) * 255  # White horizontal border
                 
-                # Add a nice camera label
-                h, w = rgb_frame.shape[:2]
-                overlay = rgb_frame.copy()
-                cv2.rectangle(overlay, (0, 0), (175, 40), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.7, rgb_frame, 0.3, 0, rgb_frame)
-                cv2.putText(rgb_frame, f"Camera {idx}", (10, 30), 
+                top_row = np.hstack((processed_frames[0], border, processed_frames[1]))
+                bottom_row = np.hstack((processed_frames[2], border, processed_frames[3]))
+                full_mosaic = np.vstack((top_row, h_border, bottom_row))
+                
+                # Add frame counter to the video mosaic
+                cv2.rectangle(full_mosaic, (full_mosaic.shape[1]-200, full_mosaic.shape[0]-50), 
+                            (full_mosaic.shape[1], full_mosaic.shape[0]), (0, 0, 0), -1)
+                cv2.putText(full_mosaic, f"Frame: {frame_number}", (full_mosaic.shape[1]-190, full_mosaic.shape[0]-11), 
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
                 
-                processed_frames.append(cv2.resize(rgb_frame, (540, 360)))
+                video_img.set_data(full_mosaic)
+                video_title.set_text(f"Multi-Camera View - {len(point_3d_list)} Objects Detected")
 
-            # Create video mosaic with a small border between frames
-            border = np.ones((360, 5, 3), dtype=np.uint8) * 255  # White vertical border
-            h_border = np.ones((5, 1085, 3), dtype=np.uint8) * 255  # White horizontal border
-            
-            top_row = np.hstack((processed_frames[0], border, processed_frames[1]))
-            bottom_row = np.hstack((processed_frames[2], border, processed_frames[3]))
-            full_mosaic = np.vstack((top_row, h_border, bottom_row))
-            
-            # Add frame counter to the video mosaic
-            cv2.rectangle(full_mosaic, (full_mosaic.shape[1]-200, full_mosaic.shape[0]-50), 
-                        (full_mosaic.shape[1], full_mosaic.shape[0]), (0, 0, 0), -1)
-            cv2.putText(full_mosaic, f"Frame: {frame_number}", (full_mosaic.shape[1]-190, full_mosaic.shape[0]-11), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-            
-            video_img.set_data(full_mosaic)
-            video_title.set_text(f"Multi-Camera View - {len(point_3d_list)} Objects Detected")
-
-        # Update 3D plot with better styling
-        if show_plot and show_3d:
-            ax_3d.clear()
-            
-            # Efficiently restore axis configuration using stored function
-            if hasattr(ax_3d, '_configure_func'):
-                ax_3d._configure_func(ax_3d)
-            else:
-                # Fallback: simple axis labels only
-                ax_3d.set_xlabel("X (m)", fontsize=11, labelpad=12, color='black')
-                ax_3d.set_ylabel("Y (m)", fontsize=11, labelpad=12, color='black')
-                ax_3d.set_zlabel("Z (m)", fontsize=11, labelpad=12, color='black')
-                ax_3d.tick_params(axis='x', colors='black', labelsize=10)
-                ax_3d.tick_params(axis='y', colors='black', labelsize=10)
-                ax_3d.tick_params(axis='z', colors='black', labelsize=10)
-            
-            # Add ground plane and enhanced camera positions for better spatial understanding
-            if hasattr(matcher, 'P_all'):
-                try:
-                    visualize_camera_positions(ax_3d, matcher.P_all)
-                except Exception as e:
-                    logging.warning(f"Error visualizing camera positions: {str(e)}")
-            
-            # Define class-specific markers (same as plot_from_json.py)
-            class_markers = {
-                0: 'o',    # pessoa (person)
-                1: 'o',    # capacete (helmet)
-                3: '^',    # robo (robot)
-                56: 's'    # cadeira (chair)
-            }
-            # # List of available markers: https://matplotlib.org/stable/api/markers_api.html
-            # all_markers = {
-            #     'point': '.',
-            #     'pixel': ',',
-            #     'circle': 'o',
-            #     'triangle_down': 'v',
-            #     'triangle_up': '^',
-            #     'triangle_left': '<',
-            #     'triangle_right': '>',
-            #     'tri_down': '1',
-            #     'tri_up': '2',
-            #     'tri_left': '3',
-            #     'tri_right': '4',
-            #     'square': 's',
-            #     'pentagon': 'p',
-            #     'star': '*',
-            #     'hexagon1': 'h',
-            #     'hexagon2': 'H',
-            #     'plus': '+',
-            #     'x': 'x',
-            #     'd': 'd',
-            #     'thin_diamond': 'D',
-            #     'vline': '|',
-            #     'hline': '_',
-            #     'None': 'None',
-            #     'tickleft': 't',
-            #     'tickright': 'T',
-            #     'tickup': 'u',
-            #     'tickdown': 'd',
-            #     'caretleft': '<',
-            #     'caretright': '>',
-            #     'caretup': '^',
-            #     'caretdown': 'v',
-            #     'caretleftbase': 'l',
-            #     'caretrightbase': 'r',
-            #     'caretupbase': 'u',
-            #     'caretdownbase': 'd',
-            #     'dash': '-',
-            #     'solid_line': '_',
-            #     'custom': 'None'
-            # }
-            # Define class names for legend (same as plot_from_json.py)
-            class_names = {
-                0: 'Person',
-                1: 'Helmet',
-                3: 'Robot', 
-                56: 'Chair'
-            }
-            
-            # Collect legend information
-            legend_elements = []
-            
-            # Plot each object with improved styling
-            for point_idx, point_3d in enumerate(point_3d_list):
-                track_id = track_ids[point_idx] if point_idx < len(track_ids) else point_idx
+            # Update 3D plot with better styling
+            if show_plot and show_3d:
+                ax_3d.clear()
                 
-                # Get class info if available
-                class_id = None
-                if sorted_class_ids and point_idx < len(sorted_class_ids):
-                    class_id = sorted_class_ids[point_idx]
-                
-                # Use consistent color based on track ID
-                if track_id in track_colors:
-                    color_rgb = track_colors[track_id]
-                    color_rgb_norm = utils.normalize_rgb_color(color_rgb)
+                # Efficiently restore axis configuration using stored function
+                if hasattr(ax_3d, '_configure_func'):
+                    ax_3d._configure_func(ax_3d)
                 else:
-                    # Fallback color using existing approach
-                    color_idx = track_id % len(PLOT_COLORS)
-                    color_rgb_norm = PLOT_COLORS[color_idx]
+                    # Fallback: simple axis labels only
+                    ax_3d.set_xlabel("X (m)", fontsize=11, labelpad=12, color='black')
+                    ax_3d.set_ylabel("Y (m)", fontsize=11, labelpad=12, color='black')
+                    ax_3d.set_zlabel("Z (m)", fontsize=11, labelpad=12, color='black')
+                    ax_3d.tick_params(axis='x', colors='black', labelsize=10)
+                    ax_3d.tick_params(axis='y', colors='black', labelsize=10)
+                    ax_3d.tick_params(axis='z', colors='black', labelsize=10)
                 
-                # Get marker for this class (same as plot_from_json.py)
-                marker = class_markers.get(int(class_id) if class_id is not None else 0, 'o')
+                # Add ground plane and enhanced camera positions for better spatial understanding
+                if hasattr(matcher, 'P_all'):
+                    try:
+                        visualize_camera_positions(ax_3d, matcher.P_all)
+                    except Exception as e:
+                        logging.warning(f"Error visualizing camera positions: {str(e)}")
                 
-                # Create legend label with class info (same format as plot_from_json.py)
-                if class_id is not None:
-                    class_name = class_names.get(int(class_id), f"Class {class_id}")
-                    legend_label = f"ID {track_id}: {class_name}"
-                else:
-                    legend_label = f"ID {track_id}: Unknown"
+                # Define class-specific markers (same as plot_from_json.py)
+                class_markers = {
+                    0: 'o',    # pessoa (person)
+                    1: 'o',    # capacete (helmet)
+                    3: '^',    # robo (robot)
+                    56: 's'    # cadeira (chair)
+                }
+                # # List of available markers: https://matplotlib.org/stable/api/markers_api.html
+                # all_markers = {
+                #     'point': '.',
+                #     'pixel': ',',
+                #     'circle': 'o',
+                #     'triangle_down': 'v',
+                #     'triangle_up': '^',
+                #     'triangle_left': '<',
+                #     'triangle_right': '>',
+                #     'tri_down': '1',
+                #     'tri_up': '2',
+                #     'tri_left': '3',
+                #     'tri_right': '4',
+                #     'square': 's',
+                #     'pentagon': 'p',
+                #     'star': '*',
+                #     'hexagon1': 'h',
+                #     'hexagon2': 'H',
+                #     'plus': '+',
+                #     'x': 'x',
+                #     'd': 'd',
+                #     'thin_diamond': 'D',
+                #     'vline': '|',
+                #     'hline': '_',
+                #     'None': 'None',
+                #     'tickleft': 't',
+                #     'tickright': 'T',
+                #     'tickup': 'u',
+                #     'tickdown': 'd',
+                #     'caretleft': '<',
+                #     'caretright': '>',
+                #     'caretup': '^',
+                #     'caretdown': 'v',
+                #     'caretleftbase': 'l',
+                #     'caretrightbase': 'r',
+                #     'caretupbase': 'u',
+                #     'caretdownbase': 'd',
+                #     'dash': '-',
+                #     'solid_line': '_',
+                #     'custom': 'None'
+                # }
+                # Define class names for legend (same as plot_from_json.py)
+                class_names = {
+                    0: 'Person',
+                    1: 'Helmet',
+                    3: 'Robot', 
+                    56: 'Chair'
+                }
                 
-                # Add object marker with class-specific marker
-                scatter = ax_3d.scatter(
-                    point_3d[0],
-                    point_3d[1],
-                    point_3d[2],
-                    c=[color_rgb_norm],
-                    s=150,
-                    marker=marker,  # Use class-specific marker
-                    edgecolors='black',
-                    linewidths=1.5,
-                    alpha=0.8,
-                    zorder=10
-                )
+                # Collect legend information
+                legend_elements = []
                 
-                # Add to legend elements for custom legend positioning
-                from matplotlib.lines import Line2D
-                legend_elements.append(Line2D([0], [0], marker=marker, color='w', 
-                                            markerfacecolor=color_rgb_norm, markersize=10,
-                                            markeredgecolor='black', markeredgewidth=1.5,
-                                            label=legend_label))
-                
-                # Plot trajectory with consistent color
-                if use_sort and track_id in trajectories and len(trajectories[track_id]) > 1:
-                    trajectory = np.array(trajectories[track_id])
-                    ax_3d.plot(
-                        trajectory[:, 0],
-                        trajectory[:, 1],
-                        trajectory[:, 2],
-                        c=color_rgb_norm,
+                # Plot each object with improved styling
+                for point_idx, point_3d in enumerate(point_3d_list):
+                    track_id = track_ids[point_idx] if point_idx < len(track_ids) else point_idx
+                    
+                    # Get class info if available
+                    class_id = None
+                    if sorted_class_ids and point_idx < len(sorted_class_ids):
+                        class_id = sorted_class_ids[point_idx]
+                    
+                    # Use consistent color based on track ID
+                    if track_id in track_colors:
+                        color_rgb = track_colors[track_id]
+                        color_rgb_norm = utils.normalize_rgb_color(color_rgb)
+                    else:
+                        # Fallback color using existing approach
+                        color_idx = track_id % len(PLOT_COLORS)
+                        color_rgb_norm = PLOT_COLORS[color_idx]
+                    
+                    # Get marker for this class (same as plot_from_json.py)
+                    marker = class_markers.get(int(class_id) if class_id is not None else 0, 'o')
+                    
+                    # Create legend label with class info (same format as plot_from_json.py)
+                    if class_id is not None:
+                        class_name = class_names.get(int(class_id), f"Class {class_id}")
+                        legend_label = f"ID {track_id}: {class_name}"
+                    else:
+                        legend_label = f"ID {track_id}: Unknown"
+                    
+                    # Add object marker with class-specific marker
+                    scatter = ax_3d.scatter(
+                        point_3d[0],
+                        point_3d[1],
+                        point_3d[2],
+                        c=[color_rgb_norm],
+                        s=150,
+                        marker=marker,  # Use class-specific marker
+                        edgecolors='black',
+                        linewidths=1.5,
                         alpha=0.8,
-                        linewidth=2.5,
-                        zorder=5
+                        zorder=10
                     )
                     
-                    # Add vertical line with consistent color
-                    ax_3d.plot(
-                        [point_3d[0], point_3d[0]],
-                        [point_3d[1], point_3d[1]], 
-                        [0, point_3d[2]],
-                        '--', 
-                        color=color_rgb_norm,
-                        alpha=0.5, 
-                        linewidth=1,
-                        zorder=4
-                    )
-            
-            # Configure 3D plot appearance
-            ax_3d.set_xlim([-4, 4])
-            ax_3d.set_ylim([-4, 4])
-            ax_3d.set_zlim([0, 4])
-            
-            # Add title with tracking information
-            title_text = f"3D Position - Frame {frame_number}"
-            if use_sort:
-                title_text += f" - 3D Tracking ({len(point_3d_list)} objects)"
-            else:
-                title_text += f" - Raw Triangulation ({len(point_3d_list)} objects)"
+                    # Add to legend elements for custom legend positioning
+                    from matplotlib.lines import Line2D
+                    legend_elements.append(Line2D([0], [0], marker=marker, color='w', 
+                                                markerfacecolor=color_rgb_norm, markersize=10,
+                                                markeredgecolor='black', markeredgewidth=1.5,
+                                                label=legend_label))
+                    
+                    # Plot trajectory with consistent color
+                    if use_sort and track_id in trajectories and len(trajectories[track_id]) > 1:
+                        trajectory = np.array(trajectories[track_id])
+                        ax_3d.plot(
+                            trajectory[:, 0],
+                            trajectory[:, 1],
+                            trajectory[:, 2],
+                            c=color_rgb_norm,
+                            alpha=0.8,
+                            linewidth=2.5,
+                            zorder=5
+                        )
+                        
+                        # Add vertical line with consistent color
+                        ax_3d.plot(
+                            [point_3d[0], point_3d[0]],
+                            [point_3d[1], point_3d[1]], 
+                            [0, point_3d[2]],
+                            '--', 
+                            color=color_rgb_norm,
+                            alpha=0.5, 
+                            linewidth=1,
+                            zorder=4
+                        )
                 
-            ax_3d.set_title(
-                title_text,
-                fontsize=14,
-                color='black',
-                fontweight='bold',
-                pad=3
-            )
-            
-            # Add custom legend with same styling as plot_from_json.py
-            if legend_elements:
-                legend = ax_3d.legend(
-                    handles=legend_elements, loc='upper left', 
-                    bbox_to_anchor=(0.01, 0.99), fontsize=11,
-                    frameon=True, fancybox=False, shadow=False
+                # Configure 3D plot appearance
+                ax_3d.set_xlim([-4, 4])
+                ax_3d.set_ylim([-4, 4])
+                ax_3d.set_zlim([0, 4])
+                
+                # Add title with tracking information
+                title_text = f"3D Position - Frame {frame_number}"
+                if use_sort:
+                    title_text += f" - 3D Tracking ({len(point_3d_list)} objects)"
+                else:
+                    title_text += f" - Raw Triangulation ({len(point_3d_list)} objects)"
+                    
+                ax_3d.set_title(
+                    title_text,
+                    fontsize=14,
+                    color='black',
+                    fontweight='bold',
+                    pad=3
                 )
-
-        # Update graph visualization if requested
-        if show_plot and show_graph and graph_ax is not None:
-            # Update node positions for persistent layout
-            for node in graph.nodes():
-                if node not in pos:
-                    cam = int(node.split("cam")[1].split("id")[0])
-                    obj_id = int(node.split("id")[1])
-                    x = (cam - 1) * 6  # Increased horizontal spacing
-                    y = obj_id * 3     # Increased vertical spacing
-                    pos[node] = (x, y)
-                    
-            # Visualize the graph
-            visualize_graph(graph, graph_ax, frame_number, pos, node_color_map)
-
-        # Update figure and handle events if plotting is enabled
-        if show_plot:
-            fig.canvas.draw()
-            fig.canvas.flush_events()
-            
-            # Small delay for smooth visualization
-            plt.pause(0.1)
-            final_frame = utils.fig_to_image(fig)
-            
-            # Save the video frame if requested
-            if save_video or (show_plot and frame_number == 0):
-                # Initialize the video writer if it hasn't been done yet
-                if video_writer is None:
-                    video_writer = cv2.VideoWriter(
-                        output_video_path,
-                        cv2.VideoWriter_fourcc(*"mp4v"),
-                        10,
-                        (final_frame.shape[1], final_frame.shape[0]),
-                    )
                 
-                final_frame_rgb = cv2.cvtColor(final_frame, cv2.COLOR_BGR2RGB)
-                video_writer.write(final_frame_rgb)
+                # Add custom legend with same styling as plot_from_json.py
+                if legend_elements:
+                    legend = ax_3d.legend(
+                        handles=legend_elements, loc='upper left', 
+                        bbox_to_anchor=(0.01, 0.99), fontsize=11,
+                        frameon=True, fancybox=False, shadow=False
+                    )
+
+            # Update graph visualization if requested
+            if show_plot and show_graph and graph_ax is not None:
+                # Update node positions for persistent layout
+                for node in graph.nodes():
+                    if node not in pos:
+                        cam = int(node.split("cam")[1].split("id")[0])
+                        obj_id = int(node.split("id")[1])
+                        x = (cam - 1) * 6  # Increased horizontal spacing
+                        y = obj_id * 3     # Increased vertical spacing
+                        pos[node] = (x, y)
+                        
+                # Visualize the graph
+                visualize_graph(graph, graph_ax, frame_number, pos, node_color_map)
+
+            # Update figure and handle events if plotting is enabled
+            if show_plot:
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                
+                # Small delay for smooth visualization
+                plt.pause(0.1)
+                final_frame = utils.fig_to_image(fig)
+                
+                # Save the video frame if requested
+                if save_video or (show_plot and frame_number == 0):
+                    # Initialize the video writer if it hasn't been done yet
+                    if video_writer is None:
+                        video_writer = cv2.VideoWriter(
+                            output_video_path,
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            10,
+                            (final_frame.shape[1], final_frame.shape[0]),
+                        )
+                    
+                    final_frame_rgb = cv2.cvtColor(final_frame, cv2.COLOR_BGR2RGB)
+                    video_writer.write(final_frame_rgb)
+                
+                # Check for exit condition if plotting is enabled
+                if not plt.fignum_exists(fig.number):
+                    break
+            # elif frame_number % 10 == 0:  # Report progress periodically when not plotting
+            #     logging.info(f"Processing frame {frame_number}/{video_loader.get_number_of_frames()}")
+            frame_number += 1
+
+        else:
+            # Handle incomplete frame collection
+            missing_cameras = [cam_numbers[i] for i, collected in enumerate(frame_collected) if not collected]
+            logging.warning(f"Frame {frame_number}: Only collected {valid_frames}/{len(cam_numbers)} frames. Missing cameras: {missing_cameras}")
             
-            # Check for exit condition if plotting is enabled
-            if not plt.fignum_exists(fig.number):
-                break
-        elif frame_number % 10 == 0:  # Report progress periodically when not plotting
-            logging.info(f"Processing frame {frame_number}/{video_loader.get_number_of_frames()}")
+            # Check for camera health issues
+            for cam in missing_cameras:
+                if cam in last_frame_time:
+                    time_since_last = current_time - last_frame_time[cam]
+                    if time_since_last > 5.0:  # 5 seconds without frames
+                        logging.error(f"Camera {cam} appears to be offline (no frames for {time_since_last:.1f}s)")
+            
+            # Small delay before retrying
+            time.sleep(0.1)
+            continue
+
     # if frame_number == 478:
     #     quit()
     # Cleanup
@@ -722,7 +805,7 @@ def main():
     if video_writer is not None:
         video_writer.release()
     
-    video_loader.release()
+    # video_loader.release()
     logging.info("Processing complete")
 
     # Export figures if requested

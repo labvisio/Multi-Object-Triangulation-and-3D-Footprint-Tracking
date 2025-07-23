@@ -1,0 +1,10 @@
+{
+    "address": "10.20.5.3:30000",
+    "cameras": [0,1,2,3],
+    "images": {
+        "width_min": 500,
+        "tuple_winStride": [4, 4],
+        "tuple_padding": [4, 4],
+        "scale": 1.05
+    }
+}
