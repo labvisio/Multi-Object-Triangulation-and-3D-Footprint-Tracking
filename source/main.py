@@ -46,7 +46,6 @@ from graph_visualization import visualize_graph
 # Intelligent space imports
 from is_msgs.image_pb2 import Image
 from google.protobuf.json_format import Parse
-from is_project.conf.options_pb2 import ServiceOptions
 from is_wire.core import Channel, Message, Subscription
 from google.protobuf.message import Message as PbMessage
 
@@ -516,6 +515,7 @@ def main():
             
             if publish_flag and point_3d_list:
                 publish(channel=publish_channel, frame=frame_number, point_3d_list=point_3d_list, track_ids=track_ids, class_ids=sorted_class_ids)
+                
             # Create video mosaic with annotations and better formatting if video visualization is enabled
             
             if show_plot and show_video:
