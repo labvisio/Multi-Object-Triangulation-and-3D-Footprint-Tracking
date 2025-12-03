@@ -8,6 +8,7 @@
 /video_sources/test_distances_video
 /video_sources/umbrella_vid
 mp4_to_gif.py
+/deteccao_gesto_apontar_e_estimativa_direcao
 
 *.pt
 
