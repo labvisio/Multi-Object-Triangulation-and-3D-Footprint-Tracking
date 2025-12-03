@@ -16,6 +16,7 @@ import argparse
 import time
 import logging
 import os
+import math
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -534,13 +535,25 @@ def main():
                     
                     processed_frames.append(cv2.resize(rgb_frame, (540, 360)))
 
-                # Create video mosaic with a small border between frames
-                border = np.ones((360, 5, 3), dtype=np.uint8) * 255  # White vertical border
-                h_border = np.ones((5, 1085, 3), dtype=np.uint8) * 255  # White horizontal border
-                
-                top_row = np.hstack((processed_frames[0], border, processed_frames[1]))
-                bottom_row = np.hstack((processed_frames[2], border, processed_frames[3]))
-                full_mosaic = np.vstack((top_row, h_border, bottom_row))
+                if processed_frames:
+                    # Arrange frames in a grid that matches the number of active cameras
+                    border_px = 5
+                    frame_h, frame_w = processed_frames[0].shape[:2]
+                    num_frames = len(processed_frames)
+                    cols = math.ceil(math.sqrt(num_frames))
+                    rows = math.ceil(num_frames / cols)
+                    mosaic_h = rows * frame_h + (rows - 1) * border_px
+                    mosaic_w = cols * frame_w + (cols - 1) * border_px
+                    full_mosaic = np.ones((mosaic_h, mosaic_w, 3), dtype=np.uint8) * 255
+
+                    for idx, processed in enumerate(processed_frames):
+                        row = idx // cols
+                        col = idx % cols
+                        y = row * (frame_h + border_px)
+                        x = col * (frame_w + border_px)
+                        full_mosaic[y:y + frame_h, x:x + frame_w] = processed
+                else:
+                    full_mosaic = np.zeros((720, 1280, 3), dtype=np.uint8)
                 
                 # Add frame counter to the video mosaic
                 cv2.rectangle(full_mosaic, (full_mosaic.shape[1]-200, full_mosaic.shape[0]-50), 

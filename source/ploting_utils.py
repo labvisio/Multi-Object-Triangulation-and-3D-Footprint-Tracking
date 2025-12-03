@@ -59,9 +59,16 @@ class Utils:
         """
         canvas = agg.FigureCanvasAgg(fig)
         canvas.draw()
-        buf = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
-        w, h = canvas.get_width_height()
-        return buf.reshape(h, w, 3)
+        try:
+            buffer = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
+        except AttributeError:
+            # Fall back for older Matplotlib versions that still expose tostring_rgb
+            buf = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
+            w, h = canvas.get_width_height()
+            return buf.reshape(h, w, 3)
+
+        rgb_buffer = buffer[..., :3]
+        return rgb_buffer.copy()
 
     def normalize_rgb_color(
         self, color: tuple[int, int, int]
